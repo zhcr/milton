@@ -22,6 +22,7 @@ from rich.rule import Rule
 from rich.prompt import Prompt
 
 from model import Milton
+from retriever import Retriever
 from tokenizer import Tokenizer
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -77,13 +78,23 @@ def generate_response(
     tok: Tokenizer,
     device: torch.device,
     user_input: str,
+    retriever: Retriever,
     max_tokens: int = 200,
     temperature: float = 0.8,
     top_p: float = 0.9,
     top_k: int = 50,
+    seed_tokens: int = 80,
 ) -> str:
-    prompt = f"<|user|>{user_input}<|milton|>"
-    prompt_ids = tok.encode(prompt)
+    # Retrieve the most relevant passage and use it as a generation seed
+    passage = retriever.find(user_input, top_k=1)[0]
+    seed_ids = tok.encode(passage)[:seed_tokens]
+
+    prompt_ids = tok.encode(f"<|user|>{user_input}<|milton|>") + seed_ids
+    # Crop to fit within context window with room to generate
+    max_prompt = model.max_seq_len - max_tokens
+    if len(prompt_ids) > max_prompt:
+        prompt_ids = prompt_ids[:max_prompt]
+
     prompt_t = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
     output = model.generate(
@@ -94,7 +105,9 @@ def generate_response(
         top_k=top_k,
     )
 
-    generated_ids = output[0].tolist()[len(prompt_ids):]
+    # The response includes the seed — return the full generated text
+    response_start = len(tok.encode(f"<|user|>{user_input}<|milton|>"))
+    generated_ids = output[0].tolist()[response_start:]
     if tok.eos_id in generated_ids:
         generated_ids = generated_ids[: generated_ids.index(tok.eos_id)]
 
@@ -184,6 +197,7 @@ def main():
 
     with console.status(f"[{DIM}]Loading Milton...[/{DIM}]", spinner="dots", spinner_style=GOLD):
         model, tok, device = load_milton(args.checkpoint)
+        retriever = Retriever()
 
     print_banner()
 
@@ -231,7 +245,7 @@ def main():
         result = [None]
         def _generate():
             result[0] = generate_response(
-                model, tok, device, user_input,
+                model, tok, device, user_input, retriever,
                 max_tokens=args.max_tokens,
                 temperature=temperature,
                 top_p=top_p,

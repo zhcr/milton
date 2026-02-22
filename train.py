@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from model import Milton
+from retriever import Retriever
 from tokenizer import Tokenizer
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -16,12 +17,13 @@ CKPT_DIR = Path(__file__).parent / "checkpoints"
 # --- Hyperparameters ---
 SEQ_LEN = 512
 BATCH_SIZE = 16
-EPOCHS = 200
+EPOCHS = 120
 LR = 3e-4
 MIN_LR = 1e-5
 WARMUP_STEPS = 100
 WEIGHT_DECAY = 0.1
-DROPOUT = 0.15
+DROPOUT = 0.2
+WORD_DROPOUT = 0.05
 GRAD_CLIP = 1.0
 DIM = 512
 N_LAYERS = 8
@@ -29,7 +31,7 @@ N_HEADS = 8
 FF_DIM = 2048
 
 # Fraction of training data formatted as chat turns
-CHAT_FRACTION = 0.15
+CHAT_FRACTION = 0.30
 
 
 class ParadiseLostDataset(Dataset):
@@ -55,41 +57,71 @@ class ParadiseLostDataset(Dataset):
     def _make_chat_sequences(
         self, tokens: list[int], tok: Tokenizer, count: int, seq_len: int
     ) -> list[list[int]]:
-        """Create chat-formatted sequences from Paradise Lost text.
+        """Create topically aligned chat sequences from Paradise Lost.
 
-        Takes random spans of the poem and formats them as:
-        <|user|> [short prompt from the text] <|milton|> [continuation] <|eos|>
+        For each passage: extract distinctive keywords via TF-IDF and use
+        them (or a short phrase from the passage) as the user prompt, with
+        the passage text as Milton's response. This teaches the model to
+        associate topic words with relevant passages.
         """
         import random
 
         random.seed(42)
-        seqs = []
-        text_len = len(tokens)
+        retriever = Retriever()
+        seqs: list[list[int]] = []
+        n_passages = len(retriever.passages)
+        reps = max(1, count // n_passages + 1)
 
-        for _ in range(count):
-            # Pick a random position in the text
-            pos = random.randint(0, text_len - seq_len)
-            # User prompt: 10-60 tokens from the text
-            prompt_len = random.randint(10, 60)
-            prompt_tokens = tokens[pos : pos + prompt_len]
-            # Milton's response: fill the rest of the sequence
-            response_start = pos + prompt_len
-            max_response = seq_len - prompt_len - 3  # room for special tokens
-            if max_response < 20:
-                continue
-            response_tokens = tokens[response_start : response_start + max_response]
+        for rep in range(reps):
+            for pidx, passage in enumerate(retriever.passages):
+                if len(seqs) >= count:
+                    break
 
-            seq = [tok.user_id] + prompt_tokens + [tok.milton_id] + response_tokens + [tok.eos_id]
+                passage_tokens = tok.encode(passage)
+                if len(passage_tokens) < 30:
+                    continue
 
-            # Pad or truncate to seq_len
-            if len(seq) < seq_len:
-                seq = seq + [tok.pad_id] * (seq_len - len(seq))
-            else:
-                seq = seq[:seq_len]
+                if rep % 2 == 0:
+                    # Keyword prompt: top TF-IDF keywords for this passage
+                    kw = retriever.keywords(pidx, top_n=random.randint(3, 5))
+                    prompt_text = " ".join(kw)
+                else:
+                    # Phrase prompt: random short phrase extracted from the passage
+                    words = passage.split()
+                    if len(words) > 6:
+                        start = random.randint(0, len(words) - 6)
+                        prompt_text = " ".join(words[start : start + random.randint(3, 6)])
+                    else:
+                        prompt_text = passage[:60]
 
-            seqs.append(seq)
+                prompt_tokens = tok.encode(prompt_text)
 
-        return seqs
+                max_response = seq_len - len(prompt_tokens) - 3
+                if max_response < 30:
+                    continue
+
+                response_tokens = passage_tokens[:max_response]
+
+                seq = (
+                    [tok.user_id]
+                    + prompt_tokens
+                    + [tok.milton_id]
+                    + response_tokens
+                    + [tok.eos_id]
+                )
+
+                if len(seq) < seq_len:
+                    seq = seq + [tok.pad_id] * (seq_len - len(seq))
+                else:
+                    seq = seq[:seq_len]
+
+                seqs.append(seq)
+
+            if len(seqs) >= count:
+                break
+
+        random.shuffle(seqs)
+        return seqs[:count]
 
     def __len__(self):
         return len(self.sequences)
@@ -172,6 +204,12 @@ def train():
 
         for batch_idx, (x, y) in enumerate(loader):
             x, y = x.to(device), y.to(device)
+
+            # Word-level dropout: randomly replace input tokens to prevent memorization
+            if WORD_DROPOUT > 0:
+                mask = torch.rand_like(x, dtype=torch.float) < WORD_DROPOUT
+                random_tokens = torch.randint(0, tok.vocab_size, x.shape, device=device)
+                x = torch.where(mask, random_tokens, x)
 
             lr = get_lr(step, total_steps)
             for pg in optimizer.param_groups:
