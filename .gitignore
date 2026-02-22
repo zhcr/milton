@@ -1,0 +1,6 @@
+.venv/
+checkpoints/
+data/paradise_lost_raw.txt
+data/tokenizer.json
+data/tokens.pt
+__pycache__/
