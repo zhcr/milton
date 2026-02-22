@@ -24,7 +24,7 @@ python3 train.py
 python3 chat.py
 ```
 
-Training takes ~55 minutes on an M3 Ultra (MPS).
+Training takes ~55 minutes on an M3 Max (MPS).
 
 ## Model
 
